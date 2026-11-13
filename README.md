@@ -113,9 +113,21 @@ The **Personal Borrowed Money Tracker** is a dedicated, responsive financial rec
 
 ---
 
-## 5. Storage Architecture & LocalStorage Limitations
+## 5. Storage Architecture & Multi-Layer Persistence
 
-1. **Persistent Browser Storage:** Records are stored in `window.localStorage` under key `pbmt_people_v1`, `pbmt_transactions_v1`, and `pbmt_repayments_v1`.
-2. **First-Load Seeding:** If storage is uninitialized, the app auto-seeds with the verified initial dataset.
-3. **Site Data Clearing Warning:** Clearing your browser's site cookies/cache will wipe out localStorage. Always export regular JSON backups to your computer or cloud drive.
-4. **Device Sync Limitation:** LocalStorage is specific to one browser on one device. It does not synchronize automatically across multiple devices unless you export/import the JSON backup.
+1. **Dual-Layer Storage Protection (LocalStorage + IndexedDB Mirror):**
+   - Every creation, update, or deletion commits immediately to synchronous `localStorage` AND mirrors asynchronously to persistent `IndexedDB`.
+   - If `localStorage` is cleared or evicted by the browser, the application automatically recovers data from `IndexedDB` on startup.
+2. **Atomic Unified State & Safety Backup Keys:**
+   - In addition to individual keys, the system maintains `pbmt_unified_state_v1` and `pbmt_safety_backup_v1` to prevent partial key losses or corruption.
+3. **Browser Storage Eviction Shield (`navigator.storage.persist()`):**
+   - The app automatically requests persistent storage permission from modern browsers (Chrome, Edge, Safari, Firefox), protecting records from automatic eviction under disk pressure.
+4. **Automatic Rolling Snapshots:**
+   - Every data mutation creates a rolling timestamped snapshot in IndexedDB. Previous snapshots can be browsed and restored with a single click in **Settings**.
+5. **Multi-Tab Synchronization & Unload Flushes:**
+   - Storage event listeners ensure multiple open tabs stay in lockstep without overwriting each other.
+   - Page unload and backgrounding listeners flush any pending state to persistent disk.
+6. **Device Sync & Mobile WebViews:**
+   - Browser storage is specific to the browser profile on that device.
+   - When using on mobile devices, avoid opening links in temporary in-app webviews (e.g., inside WhatsApp/Instagram). Always open in standard Chrome or Safari, or tap "Add to Home Screen".
+   - Maintain regular portable `.json` backups via **Settings → Download Full JSON Backup** to transfer records between phone and PC.

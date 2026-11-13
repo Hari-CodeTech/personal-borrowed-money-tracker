@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import Header from './components/Header';
 import DashboardView from './views/DashboardView';
 import AllPeopleView from './views/AllPeopleView';
@@ -19,16 +19,37 @@ import VerificationModal from './components/VerificationModal';
 import Toast from './components/Toast';
 
 // Services & Utils
-import { loadAppData, saveAppData, resetToInitialDataset } from './services/storageService';
+import { 
+  loadAppData, 
+  saveAppData, 
+  resetToInitialDataset,
+  reconcileWithIndexedDB,
+  requestStoragePersistence
+} from './services/storageService';
 import { calculateOverallTotals, runDatasetDiagnostics } from './utils/calculations';
 import { formatINR } from './utils/currency';
 
 export default function App() {
-  // Core persistent data
-  const [people, setPeople] = useState([]);
-  const [transactions, setTransactions] = useState([]);
-  const [repayments, setRepayments] = useState([]);
-  const [isLoaded, setIsLoaded] = useState(false);
+  // Core persistent data - initialized directly from verified storage
+  const [people, setPeople] = useState(() => {
+    const loaded = loadAppData();
+    return loaded.people;
+  });
+  const [transactions, setTransactions] = useState(() => {
+    const loaded = loadAppData();
+    return loaded.transactions;
+  });
+  const [repayments, setRepayments] = useState(() => {
+    const loaded = loadAppData();
+    return loaded.repayments || [];
+  });
+  const [isLoaded, setIsLoaded] = useState(true);
+
+  // Ref to always hold current state for beforeunload flush
+  const stateRef = useRef({ people, transactions, repayments });
+  useEffect(() => {
+    stateRef.current = { people, transactions, repayments };
+  }, [people, transactions, repayments]);
 
   // Active navigation view: 'dashboard' | 'people' | 'history' | 'reports' | 'settings'
   const [activeView, setActiveView] = useState('dashboard');
@@ -65,30 +86,68 @@ export default function App() {
     setToasts(prev => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
-    }, 4000);
+    }, 4500);
   }, []);
 
   const dismissToast = useCallback((id) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
-  // Initialize data on mount
+  // On initial mount: request browser persistence, reconcile with IndexedDB, and listen for multi-tab updates
   useEffect(() => {
-    const loaded = loadAppData();
-    setPeople(loaded.people);
-    setTransactions(loaded.transactions);
-    setRepayments(loaded.repayments || []);
-    setIsLoaded(true);
+    // 1. Request persistent storage from browser (Chrome, Edge, Safari, Firefox)
+    requestStoragePersistence().then(persisted => {
+      if (persisted) {
+        console.log('Browser persistent storage active: records protected from browser eviction.');
+      }
+    });
 
-    if (loaded.loadError) {
-      showToast(loaded.loadError, 'warning');
-    }
-  }, [showToast]);
+    // 2. Reconcile with IndexedDB in case localStorage was cleared by browser
+    reconcileWithIndexedDB(people.length, transactions.length).then(recovered => {
+      if (recovered) {
+        setPeople(recovered.people);
+        setTransactions(recovered.transactions);
+        setRepayments(recovered.repayments || []);
+        showToast('Restored latest records from protected secondary storage.', 'info');
+      }
+    });
 
-  // Persist to localStorage whenever data changes
+    // 3. Multi-tab synchronization
+    const handleStorageChange = (e) => {
+      if (e.key === 'pbmt_unified_state_v1' || e.key === 'pbmt_people_v1' || e.key === 'pbmt_transactions_v1') {
+        const fresh = loadAppData();
+        setPeople(fresh.people);
+        setTransactions(fresh.transactions);
+        setRepayments(fresh.repayments || []);
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+
+    // 4. Flush to storage before page unloads or tab is closed
+    const handleUnload = () => {
+      if (stateRef.current.people.length > 0) {
+        saveAppData(
+          stateRef.current.people, 
+          stateRef.current.transactions, 
+          stateRef.current.repayments, 
+          { trigger: 'page_unload' }
+        );
+      }
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    window.addEventListener('pagehide', handleUnload);
+
+    return () => {
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener('beforeunload', handleUnload);
+      window.removeEventListener('pagehide', handleUnload);
+    };
+  }, [people.length, transactions.length, showToast]);
+
+  // Persist whenever state changes (safety net)
   useEffect(() => {
-    if (isLoaded) {
-      saveAppData(people, transactions, repayments);
+    if (isLoaded && people.length > 0) {
+      saveAppData(people, transactions, repayments, { trigger: 'state_effect' });
     }
   }, [people, transactions, repayments, isLoaded]);
 
@@ -110,15 +169,19 @@ export default function App() {
   // ACTION HANDLERS: PEOPLE
   // ==========================================
   const handleSaveNewPerson = (newPerson) => {
-    setPeople(prev => [...prev, newPerson]);
+    const nextPeople = [...people, newPerson];
+    setPeople(nextPeople);
+    saveAppData(nextPeople, transactions, repayments, { trigger: 'add_person' });
     setIsAddPersonOpen(false);
-    showToast(`Added ${newPerson.name} to ${newPerson.category}.`, 'success');
+    showToast(`Added ${newPerson.name} to ${newPerson.category}. Record saved securely.`, 'success');
   };
 
   const handleUpdatePerson = (updatedPerson) => {
-    setPeople(prev => prev.map(p => p.id === updatedPerson.id ? updatedPerson : p));
+    const nextPeople = people.map(p => p.id === updatedPerson.id ? updatedPerson : p);
+    setPeople(nextPeople);
+    saveAppData(nextPeople, transactions, repayments, { trigger: 'update_person' });
     setPersonToEdit(null);
-    showToast(`Updated details for ${updatedPerson.name}.`, 'success');
+    showToast(`Updated details for ${updatedPerson.name}. Record saved.`, 'success');
   };
 
   const handleDeletePerson = (person) => {
@@ -132,9 +195,13 @@ export default function App() {
       confirmText: 'Delete Person & Records',
       isDanger: true,
       onConfirm: () => {
-        setPeople(prev => prev.filter(p => p.id !== person.id));
-        setTransactions(prev => prev.filter(t => t.personId !== person.id));
-        setRepayments(prev => prev.filter(r => r.personId !== person.id));
+        const nextPeople = people.filter(p => p.id !== person.id);
+        const nextTxs = transactions.filter(t => t.personId !== person.id);
+        const nextRepays = repayments.filter(r => r.personId !== person.id);
+        setPeople(nextPeople);
+        setTransactions(nextTxs);
+        setRepayments(nextRepays);
+        saveAppData(nextPeople, nextTxs, nextRepays, { trigger: 'delete_person' });
         if (selectedPersonId === person.id) setSelectedPersonId(null);
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         showToast(`Deleted ${person.name} and associated records.`, 'success');
@@ -151,10 +218,12 @@ export default function App() {
   };
 
   const handleSaveNewTx = (newTx) => {
-    setTransactions(prev => [...prev, newTx]);
+    const nextTxs = [...transactions, newTx];
+    setTransactions(nextTxs);
+    saveAppData(people, nextTxs, repayments, { trigger: 'add_transaction' });
     setIsAddTxOpen(false);
     const person = people.find(p => p.id === newTx.personId);
-    showToast(`Recorded ${formatINR(newTx.amount)} for ${person?.name || 'person'}.`, 'success');
+    showToast(`Recorded ${formatINR(newTx.amount)} for ${person?.name || 'person'}. Saved permanently.`, 'success');
   };
 
   const handleOpenEditTx = (tx) => {
@@ -162,9 +231,11 @@ export default function App() {
   };
 
   const handleUpdateTx = (updatedTx) => {
-    setTransactions(prev => prev.map(t => t.id === updatedTx.id ? updatedTx : t));
+    const nextTxs = transactions.map(t => t.id === updatedTx.id ? updatedTx : t);
+    setTransactions(nextTxs);
+    saveAppData(people, nextTxs, repayments, { trigger: 'update_transaction' });
     setTxToEdit(null);
-    showToast(`Transaction updated successfully.`, 'success');
+    showToast(`Transaction updated successfully and saved.`, 'success');
   };
 
   const handleDeleteTx = (tx) => {
@@ -176,7 +247,9 @@ export default function App() {
       confirmText: 'Delete Transaction',
       isDanger: true,
       onConfirm: () => {
-        setTransactions(prev => prev.filter(t => t.id !== tx.id));
+        const nextTxs = transactions.filter(t => t.id !== tx.id);
+        setTransactions(nextTxs);
+        saveAppData(people, nextTxs, repayments, { trigger: 'delete_transaction' });
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         showToast(`Transaction of ${formatINR(tx.amount)} deleted.`, 'success');
       }
@@ -192,10 +265,12 @@ export default function App() {
   };
 
   const handleSaveNewRepayment = (newRepayment) => {
-    setRepayments(prev => [...prev, newRepayment]);
+    const nextRepayments = [...repayments, newRepayment];
+    setRepayments(nextRepayments);
+    saveAppData(people, transactions, nextRepayments, { trigger: 'add_repayment' });
     setIsRecordRepaymentOpen(false);
     const person = people.find(p => p.id === newRepayment.personId);
-    showToast(`Recorded repayment of ${formatINR(newRepayment.amount)} for ${person?.name || 'person'}.`, 'success');
+    showToast(`Recorded repayment of ${formatINR(newRepayment.amount)} for ${person?.name || 'person'}. Saved.`, 'success');
   };
 
   const handleOpenEditRepayment = (repay) => {
@@ -203,9 +278,11 @@ export default function App() {
   };
 
   const handleUpdateRepayment = (updatedRepayment) => {
-    setRepayments(prev => prev.map(r => r.id === updatedRepayment.id ? updatedRepayment : r));
+    const nextRepayments = repayments.map(r => r.id === updatedRepayment.id ? updatedRepayment : r);
+    setRepayments(nextRepayments);
+    saveAppData(people, transactions, nextRepayments, { trigger: 'update_repayment' });
     setRepaymentToEdit(null);
-    showToast(`Repayment record updated.`, 'success');
+    showToast(`Repayment record updated and saved.`, 'success');
   };
 
   const handleDeleteRepayment = (repay) => {
@@ -216,7 +293,9 @@ export default function App() {
       confirmText: 'Delete Repayment',
       isDanger: true,
       onConfirm: () => {
-        setRepayments(prev => prev.filter(r => r.id !== repay.id));
+        const nextRepayments = repayments.filter(r => r.id !== repay.id);
+        setRepayments(nextRepayments);
+        saveAppData(people, transactions, nextRepayments, { trigger: 'delete_repayment' });
         setConfirmDialog(d => ({ ...d, isOpen: false }));
         showToast(`Repayment of ${formatINR(repay.amount)} deleted.`, 'success');
       }
@@ -230,7 +309,19 @@ export default function App() {
     setPeople(importedData.people);
     setTransactions(importedData.transactions);
     setRepayments(importedData.repayments || []);
+    saveAppData(importedData.people, importedData.transactions, importedData.repayments || [], { trigger: 'import_backup' });
     setSelectedPersonId(null);
+    showToast('Backup restored and committed to permanent storage.', 'success');
+  };
+
+  const handleRestoreSnapshot = (snapshotData) => {
+    if (!snapshotData || !snapshotData.people || !snapshotData.transactions) return;
+    setPeople(snapshotData.people);
+    setTransactions(snapshotData.transactions);
+    setRepayments(snapshotData.repayments || []);
+    saveAppData(snapshotData.people, snapshotData.transactions, snapshotData.repayments || [], { trigger: 'restore_snapshot' });
+    setSelectedPersonId(null);
+    showToast('Auto-backup snapshot restored successfully.', 'success');
   };
 
   const handleResetToInitial = () => {
@@ -318,6 +409,7 @@ export default function App() {
             repayments={repayments}
             totals={overallTotals}
             onImportData={handleImportBackup}
+            onRestoreSnapshot={handleRestoreSnapshot}
             onResetToInitial={handleResetToInitial}
             showToast={showToast}
           />
